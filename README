@@ -1,5 +1,7 @@
 XMOUNT README FILE
 
+Note: This is an experimental(!) fork of Xmount that has copy-on-read support.
+
 Table of contents
   0.0 Author and license stuff
   1.0 What is xmount? - A short description
