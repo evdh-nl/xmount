@@ -107,9 +107,19 @@ static char *pVirtualVmdkLockFileName=NULL;
 static FILE *hCacheFile=NULL;
 static pTCacheFileHeader pCacheFileHeader=NULL;
 static pTCacheFileBlockIndex pCacheFileBlockIndex=NULL;
+/*
+ * Copy-on-Read uses same structure as cachefile, only has a different purpose.
+ * Vars needed for copy-on-read:
+ */
+static FILE *hCoRFile=NULL;
+static pTCacheFileHeader pCoRFileHeader=NULL;
+static pTCacheFileBlockIndex pCoRFileBlockIndex=NULL;
 // Mutexes to control concurrent read & write access
 static pthread_mutex_t mutex_image_rw;
 static pthread_mutex_t mutex_info_read;
+
+//Define SetCoRImageData method
+static int SetCoRImageData(const char *buf, off_t offset, size_t size);
 
 /*
  * LogMessage:
@@ -190,6 +200,8 @@ static void PrintUsage(char *pProgramName) {
   printf("          /etc/fuse.conf or run xmount as root.\n");
   printf("  mopts:\n");
   printf("    --cache <file> : Enable virtual write support and set cachefile to use.\n");
+  printf("    --copy-on-read <file> : Enable copy-on-read support and set copy-on-read file to use.\n");
+  printf("    --copy-on-read-ro <file> : Use specified copy-on-read file as source but do not write to it.\n");
 //  printf("    --debug : Enable xmount's debug mode.\n");
   printf("    --in <itype> : Input image format. <itype> can be \"dd\"");
 #ifdef WITH_LIBEWF
@@ -364,6 +376,35 @@ static int ParseCmdLine(const int argc,
         }
         LOG_DEBUG("Enabling virtual write support using cache file \"%s\"\n",
                   XMountConfData.pCacheFile)
+      } else if(strcmp(argv[i],"--copy-on-read")==0) {
+          // Enable copy-on-read
+          // Next parameter must be copy-on-read file to write reads to
+          if((argc+1)>i) {
+            i++;
+            XMOUNT_STRSET(XMountConfData.pCoRFile,argv[i])
+            XMountConfData.CopyOnRead=TRUE;
+          } else {
+            LOG_ERROR("You must specify a copy-on-read file to write reads to!\n")
+            PrintUsage(argv[0]);
+            exit(1);
+          }
+          LOG_DEBUG("Enabling copy-on-read support using CoR file \"%s\"\n",
+                    XMountConfData.pCoRFile)
+      } else if(strcmp(argv[i],"--copy-on-read-ro")==0) {
+          // Enable copy-on-read-read-only
+          // Next parameter must be copy-on-read file to write reads to
+          if((argc+1)>i) {
+            i++;
+            XMOUNT_STRSET(XMountConfData.pCoRFile,argv[i])
+            XMountConfData.CopyOnRead=TRUE;
+            XMountConfData.CopyOnReadWriteable=FALSE;
+          } else {
+            LOG_ERROR("You must specify a copy-on-read file to write reads to!\n")
+            PrintUsage(argv[0]);
+            exit(1);
+          }
+          LOG_DEBUG("Enabling copy-on-read support using CoR file \"%s\"\n",
+                    XMountConfData.pCoRFile)
       } else if(strcmp(argv[i],"--in")==0) {
         // Specify input image type
         // Next parameter must be image type
@@ -931,6 +972,28 @@ static int GetVirtImageData(char *buf, off_t offset, size_t size) {
                     PRIu64 " at cache file offset %" PRIu64 "\n",
                     CurToRead,FileOff,
                     pCacheFileHeader->pVdiFileHeader+FileOff)
+        } else if(XMountConfData.CopyOnRead==TRUE &&
+                  pCoRFileHeader->VdiFileHeaderCached==TRUE)
+               {
+                 // VDI header was already saved
+                 if(fseeko(hCoRFile,
+                           pCoRFileHeader->pVdiFileHeader+FileOff,
+                           SEEK_SET)!=0)
+                 {
+                   LOG_ERROR("Couldn't seek to saved VDI header at offset %"
+                             PRIu64 "\n",pCoRFileHeader->pVdiFileHeader+FileOff)
+                   return 0;
+                 }
+                 if(fread(buf,CurToRead,1,hCoRFile)!=1) {
+                   LOG_ERROR("Couldn't read %zu bytes from copy-on-read file at offset %"
+                             PRIu64 "\n",CurToRead,
+                             pCoRFileHeader->pVdiFileHeader+FileOff)
+                   return 0;
+                 }
+                 LOG_DEBUG("Read %zd bytes from saved VDI header at offset %"
+                           PRIu64 " at copy-on-read file offset %" PRIu64 "\n",
+                           CurToRead,FileOff,
+                           pCoRFileHeader->pVdiFileHeader+FileOff)
         } else {
           // VDI header isn't cached
           memcpy(buf,((char*)pVdiFileHeader)+FileOff,CurToRead);
@@ -989,6 +1052,24 @@ static int GetVirtImageData(char *buf, off_t offset, size_t size) {
       }
       LOG_DEBUG("Read %zd bytes at offset %" PRIu64
                 " from cache file\n",CurToRead,FileOff)
+    } else if(XMountConfData.CopyOnRead==TRUE &&
+              pCoRFileBlockIndex[CurBlock].Assigned==TRUE)
+           {
+             // Data already read from original source, can now be read from CoR file.
+             if(fseeko(hCoRFile,
+                       pCoRFileBlockIndex[CurBlock].off_data+BlockOff,
+                       SEEK_SET)!=0)
+             {
+               LOG_ERROR("Couldn't seek to offset %" PRIu64
+                         " in copy-on-read file\n")
+               return -1;
+             }
+             if(fread(buf,CurToRead,1,hCoRFile)!=1) {
+               LOG_ERROR("Couldn't read data from copy-on-read file!\n")
+               return -1;
+             }
+             LOG_DEBUG("Read %zd bytes at offset %" PRIu64
+                       " from copy-on-read file\n",CurToRead,FileOff)
     } else {
       // No write support or data not cached
       if(GetOrigImageData(buf,
@@ -998,6 +1079,13 @@ static int GetVirtImageData(char *buf, off_t offset, size_t size) {
         LOG_ERROR("Couldn't read data from input image!\n")
         return -1;
       }
+
+	  // If copy-on-read enabled and writable;
+      if(XMountConfData.CopyOnRead && XMountConfData.CopyOnReadWriteable)
+        if(SetCoRImageData(buf,FileOff,CurToRead) !=CurToRead){
+            LOG_ERROR("Couldn't write data to copy-on-read file.");
+            return -1;
+        }
       LOG_DEBUG("Read %zd bytes at offset %" PRIu64
                 " from original image file\n",CurToRead,
                 FileOff)
@@ -1045,7 +1133,32 @@ static int GetVirtImageData(char *buf, off_t offset, size_t size) {
                     PRIu64 " at cache file offset %" PRIu64 "\n",
                     to_read_later,(FileOff-orig_image_size),
                     pCacheFileHeader->pVhdFileHeader+(FileOff-orig_image_size))
-        } else {
+        } else if (XMountConfData.CopyOnRead==TRUE &&
+                  pCoRFileHeader->VhdFileHeaderCached==TRUE)
+               {
+                 // VHD footer was already saved
+                 if(fseeko(hCoRFile,
+                           pCoRFileHeader->pVhdFileHeader+(FileOff-orig_image_size),
+                           SEEK_SET)!=0)
+                 {
+                   LOG_ERROR("Couldn't seek to copy-on-read VHD footer at offset %"
+                             PRIu64 "\n",
+                             pCoRFileHeader->pVhdFileHeader+
+                               (FileOff-orig_image_size))
+                   return 0;
+                 }
+                 if(fread(buf,to_read_later,1,hCoRFile)!=1) {
+                   LOG_ERROR("Couldn't read %zu bytes from copy-on-read file at offset %"
+                             PRIu64 "\n",to_read_later,
+                             pCoRFileHeader->pVhdFileHeader+
+                               (FileOff-orig_image_size))
+                   return 0;
+                 }
+                 LOG_DEBUG("Read %zd bytes from copy-on-read VHD footer at offset %"
+                           PRIu64 " at cache file offset %" PRIu64 "\n",
+                           to_read_later,(FileOff-orig_image_size),
+                           pCoRFileHeader->pVhdFileHeader+(FileOff-orig_image_size))
+          } else {
           // VHD header isn't cached
           memcpy(buf,
                  ((char*)pVhdFileHeader)+(FileOff-orig_image_size),
@@ -1517,6 +1630,442 @@ static int SetVirtImageData(const char *buf, off_t offset, size_t size) {
 
   return size;
 }
+
+/*
+ * SetCoRVdiFileHeaderData:
+ *   Write data to copy-on-read virtual VDI file header
+ *
+ * Params:
+ *   buf: Buffer containing data to write
+ *   offset: Offset of changes
+ *   size: Amount of bytes to write
+ *
+ * Returns:
+ *   Number of written bytes on success or "-1" on error
+ */
+static int SetCoRVdiFileHeaderData(char *buf,off_t offset,size_t size) {
+  if(offset+size>VdiFileHeaderSize) size=VdiFileHeaderSize-offset;
+  LOG_DEBUG("Need to cache %zu bytes at offset %" PRIu64
+            " from VDI header\n",size,offset)
+  if(pCoRFileHeader->VdiFileHeaderCached==1) {
+    // Header was already stored
+    if(fseeko(hCoRFile,
+              pCoRFileHeader->pVdiFileHeader+offset,
+              SEEK_SET)!=0)
+    {
+      LOG_ERROR("Couldn't seek to stored VDI header at address %"
+                PRIu64 "\n",pCoRFileHeader->pVdiFileHeader+offset)
+      return -1;
+    }
+    if(fwrite(buf,size,1,hCoRFile)!=1) {
+      LOG_ERROR("Couldn't write %zu bytes to copy-on-read file at offset %"
+                PRIu64 "\n",size,
+                pCoRFileHeader->pVdiFileHeader+offset)
+      return -1;
+    }
+    LOG_DEBUG("Wrote %zd bytes at offset %" PRIu64 " to copy-on-read file\n",
+              size,pCoRFileHeader->pVdiFileHeader+offset)
+  } else {
+    // Header wasn't already stored.
+    if(fseeko(hCoRFile,
+              0,
+              SEEK_END)!=0)
+    {
+      LOG_ERROR("Couldn't seek to end of copy-on-read file!")
+      return -1;
+    }
+    pCoRFileHeader->pVdiFileHeader=ftello(hCoRFile);
+    LOG_DEBUG("Caching whole VDI header\n")
+    if(offset>0) {
+      // Changes do not begin at offset 0, need to prepend with data from
+      // VDI header
+      if(fwrite((char*)pVdiFileHeader,offset,1,hCoRFile)!=1) {
+        LOG_ERROR("Error while writing %" PRIu64 " bytes "
+                  "to copy-on-read file at offset %" PRIu64 "!\n",
+                  offset,
+                  pCoRFileHeader->pVdiFileHeader);
+        return -1;
+      }
+      LOG_DEBUG("Prepended changed data with %" PRIu64
+                " bytes at copy-on-read file offset %" PRIu64 "\n",
+                offset,pCoRFileHeader->pVdiFileHeader)
+    }
+    // Store data
+    if(fwrite(buf,size,1,hCoRFile)!=1) {
+      LOG_ERROR("Couldn't write %zu bytes to copy-on-read file at offset %"
+                PRIu64 "\n",size,
+                pCoRFileHeader->pVdiFileHeader+offset)
+      return -1;
+    }
+    LOG_DEBUG("Wrote %zu bytes of data to copy-on-read file offset %"
+              PRIu64 "\n",size,
+              pCoRFileHeader->pVdiFileHeader+offset)
+    if(offset+size!=VdiFileHeaderSize) {
+      // Need to append data from VDI header to store whole data struct
+      if(fwrite(((char*)pVdiFileHeader)+offset+size,
+                VdiFileHeaderSize-(offset+size),
+                1,
+                hCoRFile)!=1)
+      {
+        LOG_ERROR("Couldn't write %zu bytes to copy-on-read file at offset %"
+                  PRIu64 "\n",VdiFileHeaderSize-(offset+size),
+                  (uint64_t)(pCoRFileHeader->pVdiFileHeader+offset+size))
+        return -1;
+      }
+      LOG_DEBUG("Appended %" PRIu32
+                " bytes to data at copy-on-read file offset %"
+                PRIu64 "\n",VdiFileHeaderSize-(offset+size),
+                pCoRFileHeader->pVdiFileHeader+offset+size)
+    }
+    // Mark header as stored and update header in copy-on-read file
+    pCoRFileHeader->VdiFileHeaderCached=1;
+    if(fseeko(hCoRFile,0,SEEK_SET)!=0) {
+      LOG_ERROR("Couldn't seek to offset 0 of copy-on-read file!\n")
+      return -1;
+    }
+    if(fwrite((char*)pCoRFileHeader,sizeof(TCacheFileHeader),1,hCoRFile)!=1) {
+      LOG_ERROR("Couldn't write changed copy-on-read file header!\n")
+      return -1;
+    }
+  }
+  // All important data has been written, now flush all buffers to make
+  // sure data is written to copy-on-read file
+  fflush(hCoRFile);
+#ifndef __APPLE__
+  ioctl(fileno(hCoRFile),BLKFLSBUF,0);
+#endif
+  return size;
+}
+
+/*
+ * SetCoRVhdFileHeaderData:
+ *   Write data to copy-on-read virtual VHD file footer
+ *
+ * Params:
+ *   buf: Buffer containing data to write
+ *   offset: Offset of changes
+ *   size: Amount of bytes to write
+ *
+ * Returns:
+ *   Number of written bytes on success or "-1" on error
+ */
+static int SetCoRVhdFileHeaderData(char *buf,off_t offset,size_t size) {
+  LOG_DEBUG("Need to store %zu bytes at offset %" PRIu64
+            " from VHD footer\n",size,offset)
+  if(pCoRFileHeader->VhdFileHeaderCached==1) {
+    // Header has already been stored
+    if(fseeko(hCoRFile,
+              pCoRFileHeader->pVhdFileHeader+offset,
+              SEEK_SET)!=0)
+    {
+      LOG_ERROR("Couldn't seek to stored VHD header at address %"
+                PRIu64 "\n",pCoRFileHeader->pVhdFileHeader+offset)
+      return -1;
+    }
+    if(fwrite(buf,size,1,hCoRFile)!=1) {
+      LOG_ERROR("Couldn't write %zu bytes to copy-on-read file at offset %"
+                PRIu64 "\n",size,
+                pCoRFileHeader->pVhdFileHeader+offset)
+      return -1;
+    }
+    LOG_DEBUG("Wrote %zd bytes at offset %" PRIu64 " to copy-on-read file\n",
+              size,pCoRFileHeader->pVhdFileHeader+offset)
+  } else {
+    // Header hasn't been stored yet.
+    if(fseeko(hCoRFile,
+              0,
+              SEEK_END)!=0)
+    {
+      LOG_ERROR("Couldn't seek to end of copy-on-read file!")
+      return -1;
+    }
+    pCoRFileHeader->pVhdFileHeader=ftello(hCacheFile);
+    LOG_DEBUG("Storing whole VHD header\n")
+    if(offset>0) {
+      // Changes do not begin at offset 0, need to prepend with data from
+      // VHD header
+      if(fwrite((char*)pVhdFileHeader,offset,1,hCoRFile)!=1) {
+        LOG_ERROR("Error while writing %" PRIu64 " bytes "
+                  "to copy-on-read file at offset %" PRIu64 "!\n",
+                  offset,
+                  pCoRFileHeader->pVhdFileHeader);
+        return -1;
+      }
+      LOG_DEBUG("Prepended data with %" PRIu64
+                " bytes at copy-on-read file offset %" PRIu64 "\n",
+                offset,pCoRFileHeader->pVhdFileHeader)
+    }
+    // Store data
+    if(fwrite(buf,size,1,hCoRFile)!=1) {
+      LOG_ERROR("Couldn't write %zu bytes to copy-on-read file at offset %"
+                PRIu64 "\n",size,
+                pCoRFileHeader->pVhdFileHeader+offset)
+      return -1;
+    }
+    LOG_DEBUG("Wrote %zu bytes of data to copy-on-read file offset %"
+              PRIu64 "\n",size,
+              pCoRFileHeader->pVhdFileHeader+offset)
+    if(offset+size!=sizeof(TVhdFileHeader)) {
+      // Need to append data from VHD header to store whole data struct
+      if(fwrite(((char*)pVhdFileHeader)+offset+size,
+                sizeof(TVhdFileHeader)-(offset+size),
+                1,
+                hCoRFile)!=1)
+      {
+        LOG_ERROR("Couldn't write %zu bytes to copy-on-read file at offset %"
+                  PRIu64 "\n",sizeof(TVhdFileHeader)-(offset+size),
+                  (uint64_t)(pCoRFileHeader->pVhdFileHeader+offset+size))
+        return -1;
+      }
+      LOG_DEBUG("Appended %" PRIu32
+                " bytes to changed data at copy-on-read file offset %"
+                PRIu64 "\n",sizeof(TVhdFileHeader)-(offset+size),
+                pCoRFileHeader->pVhdFileHeader+offset+size)
+    }
+    // Mark header as stored and update header in copy-on-read file
+    pCoRFileHeader->VhdFileHeaderCached=1;
+    if(fseeko(hCoRFile,0,SEEK_SET)!=0) {
+      LOG_ERROR("Couldn't seek to offset 0 of copy-on-read file!\n")
+      return -1;
+    }
+    if(fwrite((char*)pCoRFileHeader,sizeof(TCacheFileHeader),1,hCacheFile)!=1) {
+      LOG_ERROR("Couldn't write changed copy-on-read file header!\n")
+      return -1;
+    }
+  }
+  // All important data has been written, now flush all buffers to make
+  // sure data is written to copy-on-read file
+  fflush(hCoRFile);
+#ifndef __APPLE__
+  ioctl(fileno(hCoRFile),BLKFLSBUF,0);
+#endif
+  return size;
+}
+
+/*
+ * SetCoRImageData:
+ *   Write data to copy-on-read image
+ *
+ * Params:
+ *   buf: Buffer containing data to write
+ *   offset: Offset to start writing at
+ *   size: Size of data to be written
+ *
+ * Returns:
+ *   Number of written bytes on success or "-1" on error
+ */
+static int SetCoRImageData(const char *buf, off_t offset, size_t size) {
+  uint64_t CurBlock=0;
+  uint64_t VirtImageSize;
+  uint64_t OrigImageSize;
+  size_t ToWrite=0;
+  size_t to_write_later=0;
+  size_t CurToWrite=0;
+  off_t FileOff=offset;
+  off_t BlockOff=0;
+  char *WriteBuf=(char*)buf;
+  char *buf2;
+  ssize_t ret;
+
+  // Get virtual image size
+  if(!GetVirtImageSize(&VirtImageSize)) {
+    LOG_ERROR("Couldn't get virtual image size!\n")
+    return -1;
+  }
+
+  if(offset>=VirtImageSize) {
+    LOG_ERROR("Attempt to write beyond EOF of virtual image file!\n")
+    return -1;
+  }
+
+  if(offset+size>VirtImageSize) {
+    LOG_DEBUG("Attempt to write past EOF of virtual image file\n")
+    size=VirtImageSize-offset;
+  }
+
+  ToWrite=size;
+
+  // Get original image size
+  if(!GetOrigImageSize(&OrigImageSize)) {
+    LOG_ERROR("Couldn't get original image size!\n")
+    return -1;
+  }
+
+  // Cache virtual image type specific data preceeding original image data
+  switch(XMountConfData.VirtImageType) {
+    case TVirtImageType_DD:
+    case TVirtImageType_DMG:
+    case TVirtImageType_VMDK:
+    case TVirtImageType_VMDKS:
+      break;
+    case TVirtImageType_VDI:
+      if(FileOff<VdiFileHeaderSize) {
+        ret=SetCoRVdiFileHeaderData(WriteBuf,FileOff,ToWrite);
+        if(ret==-1) {
+          LOG_ERROR("Couldn't write data to copy-on-read virtual VDI file header!\n")
+          return -1;
+        }
+        if(ret==ToWrite) return ToWrite;
+        else {
+          ToWrite-=ret;
+          WriteBuf+=ret;
+          FileOff=0;
+        }
+      } else FileOff-=VdiFileHeaderSize;
+      break;
+    case TVirtImageType_VHD:
+      // When emulating VHD, make sure the while loop below only writes data
+      // available in the original image. Any VHD footer data must be written
+      // afterwards.
+      if(FileOff>=OrigImageSize) {
+        to_write_later=ToWrite;
+        ToWrite=0;
+      } else if((FileOff+ToWrite)>OrigImageSize) {
+        to_write_later=(FileOff+ToWrite)-OrigImageSize;
+        ToWrite-=to_write_later;
+      }
+      break;
+  }
+
+  // Calculate block to write data to
+  CurBlock=FileOff/CACHE_BLOCK_SIZE;
+  BlockOff=FileOff%CACHE_BLOCK_SIZE;
+
+  while(ToWrite!=0) {
+    // Calculate how many bytes we have to write to this block
+    if(BlockOff+ToWrite>CACHE_BLOCK_SIZE) {
+      CurToWrite=CACHE_BLOCK_SIZE-BlockOff;
+    } else CurToWrite=ToWrite;
+    if(pCoRFileBlockIndex[CurBlock].Assigned!=1) {
+      // Uncached block. Need to cache entire new block
+      // Seek to end of cache file to append new cache block
+      fseeko(hCoRFile,0,SEEK_END);
+      pCoRFileBlockIndex[CurBlock].off_data=ftello(hCoRFile);
+      if(BlockOff!=0) {
+        // Changed data does not begin at block boundry. Need to prepend
+        // with data from virtual image file
+        XMOUNT_MALLOC(buf2,char*,BlockOff*sizeof(char))
+        if(GetOrigImageData(buf2,FileOff-BlockOff,BlockOff)!=BlockOff) {
+          LOG_ERROR("Couldn't read data from original image file!\n")
+          return -1;
+        }
+        if(fwrite(buf2,BlockOff,1,hCoRFile)!=1) {
+          LOG_ERROR("Couldn't writing %" PRIu64 " bytes "
+                    "to copy-on-read file at offset %" PRIu64 "!\n",
+                    BlockOff,
+                    pCoRFileBlockIndex[CurBlock].off_data);
+          return -1;
+        }
+        LOG_DEBUG("Prepended changed data with %" PRIu64
+                  " bytes from copy-on-read virtual image file at offset %" PRIu64
+                  "\n",BlockOff,FileOff-BlockOff)
+        free(buf2);
+      }
+      if(fwrite(WriteBuf,CurToWrite,1,hCoRFile)!=1) {
+        LOG_ERROR("Error while writing %zd bytes "
+                  "to copy-on-read file at offset %" PRIu64 "!\n",
+                  CurToWrite,
+                  pCoRFileBlockIndex[CurBlock].off_data+BlockOff);
+        return -1;
+      }
+      if(BlockOff+CurToWrite!=CACHE_BLOCK_SIZE) {
+        // Data does not end at block boundry. Need to append
+        // with data from virtual image file
+        XMOUNT_MALLOC(buf2,char*,(CACHE_BLOCK_SIZE-
+                                 (BlockOff+CurToWrite))*sizeof(char))
+        memset(buf2,0,CACHE_BLOCK_SIZE-(BlockOff+CurToWrite));
+        if((FileOff-BlockOff)+CACHE_BLOCK_SIZE>OrigImageSize) {
+          // Original image is smaller than full cache block
+          if(GetOrigImageData(buf2,
+               FileOff+CurToWrite,
+               OrigImageSize-(FileOff+CurToWrite))!=
+             OrigImageSize-(FileOff+CurToWrite))
+          {
+            LOG_ERROR("Couldn't read data from virtual image file!\n")
+            return -1;
+          }
+        } else {
+          if(GetOrigImageData(buf2,
+               FileOff+CurToWrite,
+               CACHE_BLOCK_SIZE-(BlockOff+CurToWrite))!=
+             CACHE_BLOCK_SIZE-(BlockOff+CurToWrite))
+          {
+            LOG_ERROR("Couldn't read data from virtual image file!\n")
+            return -1;
+          }
+        }
+        if(fwrite(buf2,
+                  CACHE_BLOCK_SIZE-(BlockOff+CurToWrite),
+                  1,
+                  hCoRFile)!=1)
+        {
+          LOG_ERROR("Error while writing %zd bytes "
+                    "to copy-on-read file at offset %" PRIu64 "!\n",
+                    CACHE_BLOCK_SIZE-(BlockOff+CurToWrite),
+                    pCoRFileBlockIndex[CurBlock].off_data+
+                      BlockOff+CurToWrite);
+          return -1;
+        }
+        free(buf2);
+      }
+      // All important data for this block has been written,
+      // flush all buffers and mark copy-on-read block as assigned
+      fflush(hCoRFile);
+#ifndef __APPLE__
+      ioctl(fileno(hCoRFile),BLKFLSBUF,0);
+#endif
+      pCoRFileBlockIndex[CurBlock].Assigned=1;
+      // Update cache block index entry in cache file
+      fseeko(hCoRFile,
+             sizeof(TCacheFileHeader)+(CurBlock*sizeof(TCacheFileBlockIndex)),
+             SEEK_SET);
+      if(fwrite(&(pCoRFileBlockIndex[CurBlock]),
+                sizeof(TCacheFileBlockIndex),
+                1,
+                hCoRFile)!=1)
+      {
+        LOG_ERROR("Couldn't update copy-on-read file block index!\n");
+        return -1;
+      }
+      LOG_DEBUG("Updated copy-on-read file block index: Number=%" PRIu64
+                ", Data offset=%" PRIu64 "\n",CurBlock,
+                pCoRFileBlockIndex[CurBlock].off_data);
+    }
+    // Flush buffers
+    fflush(hCoRFile);
+#ifndef __APPLE__
+    ioctl(fileno(hCoRFile),BLKFLSBUF,0);
+#endif
+    BlockOff=0;
+    CurBlock++;
+    WriteBuf+=CurToWrite;
+    ToWrite-=CurToWrite;
+    FileOff+=CurToWrite;
+  }
+
+  if(to_write_later!=0) {
+    // Cache virtual image type specific data preceeding original image data
+    switch(XMountConfData.VirtImageType) {
+      case TVirtImageType_DD:
+      case TVirtImageType_DMG:
+      case TVirtImageType_VMDK:
+      case TVirtImageType_VMDKS:
+      case TVirtImageType_VDI:
+        break;
+      case TVirtImageType_VHD:
+        // Micro$oft has choosen to use a footer rather then a header.
+        ret=SetCoRVhdFileHeaderData(WriteBuf,FileOff-OrigImageSize,to_write_later);
+        if(ret==-1) {
+          LOG_ERROR("Couldn't write data to copy-on-read virtual VHD file footer!\n")
+          return -1;
+        }
+        break;
+    }
+  }
+
+  return size;
+}
+
 
 /*
  * GetVirtFileAccess:
@@ -2702,6 +3251,175 @@ static int InitCacheFile() {
 }
 
 /*
+ * InitCoRFile:
+ *   Create / load CoR file to enable copy-on-read support
+ *
+ * Params:
+ *   n/a
+ *
+ * Returns:
+ *   "TRUE" on success, "FALSE" on error
+ */
+static int InitCoRFile() {
+  uint64_t ImageSize=0;
+  uint64_t BlockIndexSize=0;
+  uint64_t CacheFileHeaderSize=0;
+  uint64_t CacheFileSize=0;
+  uint32_t NeededBlocks=0;
+  uint64_t buf;
+
+  //@TODO: Implement OverwriteCoR feature.
+  if(1) {
+    // Try to open an existing cache file or create a new one
+
+    if(XMountConfData.CopyOnReadWriteable)
+        hCoRFile=(FILE*)FOPEN(XMountConfData.pCoRFile,"rb+");
+    else
+        hCoRFile=(FILE*)FOPEN(XMountConfData.pCoRFile,"r");
+
+    if(hCoRFile==NULL) {
+      if(!XMountConfData.CopyOnReadWriteable){
+          LOG_ERROR("Copy-on-write file does not exist. Method is read only so exit.\n")
+          return FALSE;
+      }
+
+      // As the c lib seems to have no possibility to open a file rw wether it
+      // exists or not (w+ does not work because it truncates an existing file),
+      // when r+ returns NULL the file could simply not exist
+      LOG_DEBUG("Copy-on-write file does not exist. Creating new one\n")
+      hCoRFile=(FILE*)FOPEN(XMountConfData.pCoRFile,"wb+");
+      if(hCoRFile==NULL) {
+        // There is really a problem opening the file
+        LOG_ERROR("Couldn't open copy-on-read file \"%s\"!\n",
+                  XMountConfData.pCoRFile)
+        return FALSE;
+      }
+    }
+  } else {
+    // Overwrite existing CoR file or create a new one
+    hCoRFile=(FILE*)FOPEN(XMountConfData.pCoRFile,"wb+");
+    if(hCoRFile==NULL) {
+      LOG_ERROR("Couldn't open copy-on-read file \"%s\"!\n",
+                XMountConfData.pCoRFile)
+      return FALSE;
+    }
+  }
+
+  // Get input image size
+  if(!GetOrigImageSize(&ImageSize)) {
+    LOG_ERROR("Couldn't get input image size!\n")
+    return FALSE;
+  }
+
+  // Calculate how many blocks are needed and how big the buffers must be
+  // for the actual copy-on-read file version
+  NeededBlocks=ImageSize/CACHE_BLOCK_SIZE;
+  if((ImageSize%CACHE_BLOCK_SIZE)!=0) NeededBlocks++;
+  BlockIndexSize=NeededBlocks*sizeof(TCacheFileBlockIndex);
+  CacheFileHeaderSize=sizeof(TCacheFileHeader)+BlockIndexSize;
+  LOG_DEBUG("Copy-on-Read blocks: %u (%04X) entries, %zd (%08zX) bytes\n",
+            NeededBlocks,
+            NeededBlocks,
+            BlockIndexSize,
+            BlockIndexSize)
+
+  // Get copy-on-read file size
+  // fseeko64 had massive problems!
+  if(fseeko(hCoRFile,0,SEEK_END)!=0) {
+    LOG_ERROR("Couldn't seek to end of copy-on-read file!\n")
+    return FALSE;
+  }
+  // Same here, ftello64 didn't work at all and returned 0 all the times
+  CacheFileSize=ftello(hCoRFile);
+  LOG_DEBUG("copy-on-read file has %zd bytes\n",CacheFileSize)
+
+  if(CacheFileSize>0) {
+    // Cache file isn't empty, parse block header
+    LOG_DEBUG("copy-on-read file not empty. Parsing block header\n")
+    if(fseeko(hCoRFile,0,SEEK_SET)!=0) {
+      LOG_ERROR("Couldn't seek to beginning of copy-on-read file!\n")
+      return FALSE;
+    }
+    // Read and check file signature
+    if(fread(&buf,8,1,hCoRFile)!=1 || buf!=CACHE_FILE_SIGNATURE) {
+      free(pCoRFileHeader);
+      LOG_ERROR("Not an xmount cache file or cache file corrupt!\n")
+      return FALSE;
+    }
+    // Now get cache file version (Has only 32bit!)
+    if(fread(&buf,4,1,hCoRFile)!=1) {
+      free(pCoRFileHeader);
+      LOG_ERROR("Not an xmount cache file or cache file corrupt!\n")
+      return FALSE;
+    }
+    switch((uint32_t)buf) {
+      case 0x00000001:
+        // Old v1 cache file.
+        LOG_ERROR("Unsupported cache file version!\n")
+        LOG_ERROR("Please use xmount-tool to upgrade your cache file.\n")
+        return FALSE;
+      case CUR_CACHE_FILE_VERSION:
+        // Current version
+        if(fseeko(hCoRFile,0,SEEK_SET)!=0) {
+          LOG_ERROR("Couldn't seek to beginning of copy-on-read file!\n")
+          return FALSE;
+        }
+        // Alloc memory for header and block index
+        XMOUNT_MALLOC(pCoRFileHeader,pTCacheFileHeader,CacheFileHeaderSize)
+        memset(pCoRFileHeader,0,CacheFileHeaderSize);
+        // Read header and block index from file
+        if(fread(pCoRFileHeader,CacheFileHeaderSize,1,hCoRFile)!=1) {
+          // copy-on-read file isn't big enough
+          free(pCoRFileHeader);
+          LOG_ERROR("copy-on-read file corrupt!\n")
+          return FALSE;
+        }
+        break;
+      default:
+        LOG_ERROR("Unknown cache file version!\n")
+        return FALSE;
+    }
+    // Check if copy-on-read file has same block size as we do
+    if(pCoRFileHeader->BlockSize!=CACHE_BLOCK_SIZE) {
+      LOG_ERROR("copy-on-read file does not use default cache block size!\n")
+      return FALSE;
+    }
+    // Set pointer to block index
+    pCoRFileBlockIndex=(pTCacheFileBlockIndex)((void*)pCoRFileHeader+
+                          pCoRFileHeader->pBlockIndex);
+  } else {
+    // New cache file, generate a new block header
+    LOG_DEBUG("copy-on-read file is empty. Generating new block header\n");
+    // Alloc memory for header and block index
+    XMOUNT_MALLOC(pCoRFileHeader,pTCacheFileHeader,CacheFileHeaderSize)
+    memset(pCoRFileHeader,0,CacheFileHeaderSize);
+    pCoRFileHeader->FileSignature=CACHE_FILE_SIGNATURE;
+    pCoRFileHeader->CacheFileVersion=CUR_CACHE_FILE_VERSION;
+    pCoRFileHeader->BlockSize=CACHE_BLOCK_SIZE;
+    pCoRFileHeader->BlockCount=NeededBlocks;
+    //pCacheFileHeader->UsedBlocks=0;
+    // The following pointer is only usuable when reading data from cache file
+    pCoRFileHeader->pBlockIndex=sizeof(TCacheFileHeader);
+    pCoRFileBlockIndex=(pTCacheFileBlockIndex)((void*)pCoRFileHeader+
+                         sizeof(TCacheFileHeader));
+    pCoRFileHeader->VdiFileHeaderCached=FALSE;
+    pCoRFileHeader->pVdiFileHeader=0;
+    pCoRFileHeader->VmdkFileCached=FALSE;
+    pCoRFileHeader->VmdkFileSize=0;
+    pCoRFileHeader->pVmdkFile=0;
+    pCoRFileHeader->VhdFileHeaderCached=FALSE;
+    pCoRFileHeader->pVhdFileHeader=0;
+    // Write header to file
+    if(fwrite(pCoRFileHeader,CacheFileHeaderSize,1,hCoRFile)!=1) {
+      free(pCoRFileHeader);
+      LOG_ERROR("Couldn't write cache file header to copy-on-read file!\n");
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/*
  * Struct containing implemented FUSE functions
  */
 static struct fuse_operations xmount_operations = {
@@ -2750,6 +3468,9 @@ int main(int argc, char *argv[])
   XMountConfData.Writable=FALSE;
   XMountConfData.OverwriteCache=FALSE;
   XMountConfData.pCacheFile=NULL;
+  XMountConfData.CopyOnRead=FALSE;
+  XMountConfData.CopyOnReadWriteable=TRUE;
+  XMountConfData.pCoRFile=NULL;
   XMountConfData.OrigImageSize=0;
   XMountConfData.VirtImageSize=0;
   XMountConfData.InputHashLo=0;
@@ -2953,6 +3674,15 @@ int main(int argc, char *argv[])
     LOG_DEBUG("Cache file initialized successfully\n")
   }
 
+  if(XMountConfData.CopyOnRead) {
+    // Init copy-on-read file and copy-on-read file block index
+    if(!InitCoRFile()) {
+      LOG_ERROR("Couldn't initialize copy-on-read file!\n")
+      return 1;
+    }
+    LOG_DEBUG("Copy-on-read file initialized successfully\n")
+  }
+
   // Call fuse_main to do the fuse magic
   ret=fuse_main(nargc,ppNargv,&xmount_operations,NULL);
 
@@ -2988,6 +3718,12 @@ int main(int argc, char *argv[])
     // Write support was enabled, close cache file
     fclose(hCacheFile);
     free(pCacheFileHeader);
+  }
+
+  if(XMountConfData.CopyOnRead) {
+    // Copy-on-read support was enabled, close CoR file
+    fclose(hCoRFile);
+    free(pCoRFileHeader);
   }
 
   // Free allocated memory

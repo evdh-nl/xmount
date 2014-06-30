@@ -94,6 +94,12 @@ typedef struct TXMountConfData {
   uint32_t OverwriteCache;
   /** Cache file to save changes to */
   char *pCacheFile;
+  /** Enable virtual write support */
+  uint32_t CopyOnRead;
+  /** Enable virtual write support */
+  uint32_t CopyOnReadWriteable;
+  /** Cache file to save changes to */
+  char *pCoRFile;
   /** Size of input image */
   uint64_t OrigImageSize;
   /** Size of virtual image */
